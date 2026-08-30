@@ -1,0 +1,128 @@
+/* YouTube Per-Channel Speed Widget — hover-only */
+#yt-pcs-widget {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: rgba(0, 0, 0, 0.72);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  color: #fff;
+  font-family: Roboto, Arial, sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 20px;
+  border: 1px solid rgba(255,255,255,0.15);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 150ms ease, transform 150ms ease;
+  transform: translateY(-4px);
+  user-select: none;
+  white-space: nowrap;
+}
+
+/* Hover logic: visible when player hovered or widget itself hovered/focused */
+#movie_player:hover #yt-pcs-widget,
+.html5-video-container:hover #yt-pcs-widget,
+#yt-pcs-widget:hover,
+#yt-pcs-widget:focus-within,
+#yt-pcs-widget.yt-pcs-visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+
+/* Shorts specific */
+ytd-reel-video-renderer:hover #yt-pcs-widget,
+#shorts-player:hover #yt-pcs-widget {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+
+.yt-pcs-btn {
+  appearance: none;
+  border: none;
+  background: rgba(255,255,255,0.14);
+  color: #fff;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 120ms ease, transform 80ms ease;
+  padding: 0;
+}
+
+.yt-pcs-btn:hover {
+  background: rgba(255,255,255,0.28);
+}
+
+.yt-pcs-btn:active {
+  transform: scale(0.92);
+  background: rgba(255,255,255,0.35);
+}
+
+.yt-pcs-btn:focus-visible {
+  outline: 2px solid #3ea6ff;
+  outline-offset: 1px;
+}
+
+.yt-pcs-label {
+  min-width: 52px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.2px;
+  padding: 0 2px;
+}
+
+.yt-pcs-channel {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  font-weight: 400;
+  opacity: 0.85;
+  border-right: 1px solid rgba(255,255,255,0.2);
+  padding-right: 6px;
+  margin-right: 2px;
+}
+
+.yt-pcs-toast {
+  position: absolute;
+  top: 48px;
+  right: 12px;
+  background: rgba(0,0,0,0.85);
+  color: #fff;
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  opacity: 0;
+  transform: translateY(-6px);
+  transition: opacity 150ms ease, transform 150ms ease;
+  pointer-events: none;
+  z-index: 10000;
+}
+
+.yt-pcs-toast.yt-pcs-toast-show {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Ensure player container is positioning context if not already */
+#movie_player,
+.html5-video-container,
+#shorts-player,
+ytd-reel-video-renderer {
+  /* don't override YouTube's position, but ensure widget absolute works */
+}

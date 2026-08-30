@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>YouTube Per-Channel Speed</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="header">
+    <h1>Per-Channel Speed</h1>
+    <span class="subtitle">YouTube — hover widget on video</span>
+  </header>
+
+  <div class="toolbar">
+    <input id="search" type="search" placeholder="Search channels…" autocomplete="off" />
+    <span id="count" class="count"></span>
+  </div>
+
+  <div id="list" class="list"></div>
+  <div id="empty" class="empty" hidden>No channels saved yet.<br/>Use <b>[+]/[−]</b> on a video to save.</div>
+
+  <footer class="footer">
+    <div class="import-export">
+      <button id="exportBtn" class="btn primary">Export JSON</button>
+      <label class="btn">
+        Import JSON
+        <input id="importFile" type="file" accept=".json,application/json" hidden />
+      </label>
+    </div>
+    <div class="import-options">
+      <label><input type="radio" name="mode" value="merge" checked /> Merge</label>
+      <label><input type="radio" name="mode" value="replace" /> Replace</label>
+    </div>
+    <div id="status" class="status" role="status" aria-live="polite"></div>
+  </footer>
+
+  <script src="../lib/storage.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
