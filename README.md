@@ -41,4 +41,11 @@ icons/
 
 ## Notes
 - Ads (`.ad-showing`) are ignored when setting `playbackRate`.
+- The content script runs at `document_start` and injects a tiny main-world
+  bridge, so the saved speed is applied the moment the video can play rather
+  than after page load.
 - YouTube SPA navigation (`yt-navigate-finish`) is observed; no reload needed.
+- A watchdog re-asserts the speed if YouTube resets it (ad end, autoplay,
+  player reload), but never fights a speed you pick from YouTube's own menu.
+- If the channel can't be identified (early load, Shorts transitions), the
+  speed is stored under a site-wide fallback so changes are never lost.

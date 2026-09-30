@@ -9,6 +9,17 @@
   let lastAppliedSpeed = null;
   let channelPollTimer = null;
   let widgetMounted = false;
+  let pendingApplySpeed = null; // target rate we still owe the video
+  let pageChannelInfo = null; // channel info reported by the main-world bridge
+
+  // Content-script-scoped speed cache so repeated lookups (and the 0-ms bridge
+  // event) never wait on chrome.storage more than once per page lifetime.
+  const channelSpeedCache = Object.create(null);
+  let cachePopulated = false;
+
+  // Fallback bucket used when the channel can't be identified; keeps playback
+  // speed working instead of silently dropping the setting.
+  const DEFAULT_KEY = "__default__";
 
   function isWatchPage() {
     return location.pathname === "/watch" || location.pathname.startsWith("/watch");
@@ -21,11 +32,13 @@
   }
 
   function getVideoElement() {
-    // Prefer main video, ignore ad videos handled separately
-    const vids = document.querySelectorAll("video.html5-main-video, video.video-stream");
+    // Prefer the main watch player, then shorts, then any non-ad video.
+    const vids = document.querySelectorAll(
+      "video.html5-main-video, #shorts-player video, video.video-stream"
+    );
     for (const v of vids) {
-      if (v && v.src) return v;
-      if (v && v.closest && !v.closest(".ad-showing")) return v;
+      if (v && v.closest && v.closest(".ad-showing")) continue;
+      return v;
     }
     return document.querySelector("video");
   }
@@ -43,11 +56,15 @@
 
   function extractChannelInfo() {
     // Returns { key, channelId, handle, name } or null
+    // 0) Main-world bridge data (most reliable, available very early)
+    if (pageChannelInfo) return pageChannelInfo;
+
     let channelId = null;
     let handle = null;
     let name = null;
 
-    // 1) From ytInitialData / ytInitialPlayerResponse (most reliable)
+    // 1) From ytInitialData / ytInitialPlayerResponse (only directly reachable
+    //    in the page world; kept as a fallback when the bridge is unavailable)
     try {
       // ytInitialPlayerResponse is set on window
       const pr = window.ytInitialPlayerResponse;
@@ -193,24 +210,59 @@
     widgetMounted = false;
   }
 
-  function applySpeedToVideo(speed) {
-    const video = getVideoElement();
-    if (!video) return;
-    if (isAdShowing()) return;
+  function cacheSpeed(info, speed) {
+    if (!info || speed === undefined || speed === null) return;
+    if (info.channelId) channelSpeedCache[info.channelId] = speed;
+    if (info.handle) channelSpeedCache[info.handle] = speed;
+    if (info.key) channelSpeedCache[info.key] = speed;
+  }
 
-    const target = Math.min(400, Math.max(25, Math.round(speed))) / 100;
-    // Avoid loop: only set if different enough
-    if (Math.abs(video.playbackRate - target) < 0.01) return;
+  function getCachedSpeed(info) {
+    if (!info) return undefined;
+    if (info.channelId && info.channelId in channelSpeedCache) return channelSpeedCache[info.channelId];
+    if (info.handle && info.handle in channelSpeedCache) return channelSpeedCache[info.handle];
+    if (info.key && info.key in channelSpeedCache) return channelSpeedCache[info.key];
+    return undefined;
+  }
 
-    isApplyingRate = true;
-    try {
-      video.playbackRate = target;
-      video.defaultPlaybackRate = target;
-      lastAppliedSpeed = Math.round(target * 100);
-    } finally {
-      // Reset flag next tick to avoid catching our own ratechange
-      setTimeout(() => { isApplyingRate = false; }, 100);
+  function seedCacheFromSync() {
+    cachePopulated = true;
+    if (!STORAGE.storageGetSync) return;
+    const raw = STORAGE.storageGetSync(STORAGE.STORAGE_KEY);
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+    for (const [k, v] of Object.entries(raw)) {
+      if (!v || typeof v !== "object") continue;
+      const s = STORAGE.clampSpeed ? STORAGE.clampSpeed(v.speed) : null;
+      if (s !== null) channelSpeedCache[k] = s;
     }
+  }
+
+  // Remembers the desired rate and applies it as soon as a video exists.
+  // Returns true if a video element was available.
+  function applySpeedToVideo(speed) {
+    const target = Math.min(400, Math.max(25, Math.round(speed))) / 100;
+    pendingApplySpeed = target;
+
+    const video = getVideoElement();
+    if (!video || isAdShowing()) return false;
+
+    if (Math.abs(video.playbackRate - target) >= 0.01) {
+      isApplyingRate = true;
+      video._ytpcsSetAt = Date.now();
+      try {
+        video.playbackRate = target;
+        video.defaultPlaybackRate = target;
+        lastAppliedSpeed = Math.round(target * 100);
+      } finally {
+        // Reset flag next tick to avoid catching our own ratechange
+        setTimeout(() => { isApplyingRate = false; }, 100);
+      }
+    }
+
+    // The pending intent is intentionally NOT cleared: YouTube resets the rate
+    // on ads, autoplay and source swaps, and a persistent target lets the
+    // watchdog re-assert it in all of those cases.
+    return true;
   }
 
   async function resolveAndApplyForCurrentChannel() {
@@ -225,6 +277,16 @@
     currentChannel = info;
     Widget.setChannel({ key: info.key, handle: info.handle, name: info.name, channelId: info.channelId });
 
+    // Fast path: an in-page cache or a synchronous storage snapshot lets us set
+    // the rate in the same tick, i.e. before the video starts playing.
+    if (!cachePopulated) seedCacheFromSync();
+    const cached = getCachedSpeed(info);
+    if (cached !== undefined) {
+      Widget.updateSpeedDisplay(cached);
+      applySpeedToVideo(cached);
+      return info;
+    }
+
     // Resolve speed: try channelId first, then handle fallback
     let saved = null;
     if (info.channelId) {
@@ -237,13 +299,15 @@
     if (!saved && info.key) {
       saved = await STORAGE.getChannelSpeed(info.key);
     }
+    // Last resort: the site-wide default for channels we can't fingerprint.
+    if (!saved) {
+      saved = await STORAGE.getChannelSpeed(DEFAULT_KEY);
+    }
 
     const speed = saved ? saved.speed : 100;
+    cacheSpeed(info, speed);
     Widget.updateSpeedDisplay(speed);
     applySpeedToVideo(speed);
-    // Also try again after video metadata loads
-    setTimeout(() => applySpeedToVideo(speed), 500);
-    setTimeout(() => applySpeedToVideo(speed), 1500);
     return info;
   }
 
@@ -252,6 +316,8 @@
     let attempts = 0;
     const tryOnce = async () => {
       attempts++;
+      // Nudge the page-world bridge: keeps info fresh across Shorts scrolls too.
+      requestPageChannelInfo();
       const found = await resolveAndApplyForCurrentChannel();
       if (found) {
         clearInterval(channelPollTimer);
@@ -275,38 +341,44 @@
   function bindVideoListeners() {
     const video = getVideoElement();
     if (!video) return;
-    const src = video.currentSrc || video.src || "";
-    if (src && src === lastVideoSrc) {
-      // already bound for this src
+    if (video._ytpcsBound) {
+      // Already bound for this element; just re-apply any owed rate.
+      if (pendingApplySpeed !== null) applySpeedToVideo(pendingApplySpeed);
       return;
     }
-    lastVideoSrc = src;
+    video._ytpcsBound = true;
+    lastVideoSrc = video.currentSrc || video.src || "";
 
-    // Re-apply on metadata loaded and play
-    video.addEventListener("loadedmetadata", () => {
-      if (currentChannel) {
-        const speed = Widget.getCurrentSpeed();
-        applySpeedToVideo(speed);
-      } else {
-        pollForChannel();
-      }
-    });
+    // Re-apply at every point where YouTube could clobber the rate.
+    const tryApply = () => {
+      if (pendingApplySpeed === null) return;
+      if (isAdShowing()) return;
+      applySpeedToVideo(pendingApplySpeed);
+    };
+
+    video.addEventListener("loadedmetadata", tryApply);
+    video.addEventListener("loadeddata", tryApply);
+    video.addEventListener("canplay", tryApply);
+    video.addEventListener("playing", tryApply);
 
     video.addEventListener("play", () => {
-      // YouTube may reset rate on play after ad
-      if (isAdShowing()) return;
-      const speed = Widget.getCurrentSpeed();
-      if (speed !== 100) {
-        // small delay to beat YouTube's reset
-        setTimeout(() => applySpeedToVideo(speed), 50);
-      }
+      // Late channel detection: if we still don't know the channel, ask now.
+      if (!currentChannel && isRelevantPage()) pollForChannel(30);
+      // YouTube can reset the rate on play (e.g. after an ad). Re-apply soon.
+      setTimeout(tryApply, 30);
+      setTimeout(tryApply, 250);
     });
 
     video.addEventListener("ratechange", () => {
       if (isApplyingRate) return;
-      // User changed via YouTube's own menu — we could optionally sync?
-      // For now, ignore unless it's ad; don't overwrite saved value automatically
+      // Re-assert only when YouTube dropped us back to its default 1x (ad end,
+      // autoplay, source swap). A deliberate pick via YouTube's own menu is
+      // respected so we don't fight the user.
+      if (Math.abs(video.playbackRate - 1) < 0.001) setTimeout(tryApply, 20);
     });
+
+    // If we already know the target and a video is present, apply right now.
+    if (pendingApplySpeed !== null) applySpeedToVideo(pendingApplySpeed);
   }
 
   function handleWidgetChange(newSpeed, channel) {
@@ -315,7 +387,17 @@
     applySpeedToVideo(newSpeed);
 
     if (!chan || !chan.key) {
-      Widget.showToast(`Speed ${newSpeed}% (channel not detected)`);
+      // No channel detected yet — remember it site-wide so the speed still
+      // applies on reload instead of being silently dropped.
+      STORAGE.setChannelSpeed(DEFAULT_KEY, {
+        handle: "",
+        name: "All channels",
+        speed: newSpeed,
+      }).then(() => {
+        Widget.showToast(`Saved ${newSpeed}% for all channels`);
+      }).catch((e) => {
+        Widget.showToast(`Failed to save: ${e.message}`);
+      });
       return;
     }
 
@@ -341,15 +423,24 @@
     // Reset state
     lastVideoSrc = "";
     currentChannel = null;
+    pendingApplySpeed = null;
+    lastAppliedSpeed = null;
+    pageChannelInfo = null;
+    requestPageChannelInfo();
     Widget.updateSpeedDisplay(100);
     Widget.setChannel(null);
     ensureWidgetMounted();
     bindVideoListeners();
     if (isRelevantPage()) {
-      pollForChannel();
-      // Also bind video observer after delay
-      setTimeout(bindVideoListeners, 800);
-      setTimeout(() => { ensureWidgetMounted(); pollForChannel(6); }, 1500);
+      // Poll until the channel is known (up to ~15s) so a slow page load can't
+      // leave the speed unapplied.
+      pollForChannel(30);
+      setTimeout(bindVideoListeners, 300);
+      setTimeout(bindVideoListeners, 1000);
+      setTimeout(() => {
+        ensureWidgetMounted();
+        if (!currentChannel) pollForChannel(12);
+      }, 1500);
     } else {
       clearInterval(channelPollTimer);
     }
@@ -375,23 +466,101 @@
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
 
-    // Poll video element for src changes (YouTube reuses video tag)
+    // Poll video element for src changes (YouTube reuses the video tag) and
+    // re-assert any rate YouTube reset behind our back.
     setInterval(() => {
       if (!isRelevantPage()) return;
       const v = getVideoElement();
-      if (v) {
-        const src = v.currentSrc || v.src || "";
-        if (src !== lastVideoSrc) bindVideoListeners();
-        // Re-apply if drifted (YouTube reset)
-        if (!isAdShowing() && !isApplyingRate) {
-          const expected = Widget.getCurrentSpeed();
-          if (expected !== 100 && Math.abs(v.playbackRate * 100 - expected) > 1) {
-            // Only re-apply if we have a saved channel speed
-            if (currentChannel) applySpeedToVideo(expected);
+      if (!v) return;
+      const src = v.currentSrc || v.src || "";
+      if (src !== lastVideoSrc) bindVideoListeners();
+      if (pendingApplySpeed !== null && !isAdShowing() && !isApplyingRate) {
+        const resetToDefault =
+          Math.abs(v.playbackRate - 1) < 0.001 && Math.abs(pendingApplySpeed - 1) >= 0.01;
+        if (resetToDefault) applySpeedToVideo(pendingApplySpeed);
+      }
+    }, 1000);
+  }
+
+  // --- Main-world bridge ---------------------------------------------------
+  // Content scripts run in an isolated world and cannot see YouTube's page
+  // globals (ytInitialPlayerResponse), so channel detection used to depend on
+  // the DOM rendering. This function is stringified and injected into the page
+  // world; it reports the current channel back over postMessage.
+  function pageBridgeFn() {
+    function post() {
+      var info = null;
+      try {
+        var pr = window.ytInitialPlayerResponse;
+        if (pr && pr.videoDetails) {
+          info = {
+            channelId: pr.videoDetails.channelId || null,
+            name: pr.videoDetails.author || null,
+            handle: null,
+          };
+          var mf = pr.microformat && pr.microformat.playerMicroformatRenderer;
+          if (mf && mf.ownerProfileUrl) {
+            var hm = mf.ownerProfileUrl.match(/\/@([^/?#]+)/);
+            if (hm) info.handle = "@" + hm[1];
+            var cm = mf.ownerProfileUrl.match(/\/channel\/(UC[^/?#]+)/);
+            if (cm && !info.channelId) info.channelId = cm[1];
           }
         }
-      }
-    }, 2000);
+      } catch (e) { info = null; }
+      try {
+        window.postMessage({ source: "ytpcs", type: "channel", info: info }, "*");
+      } catch (e) {}
+    }
+    post();
+    window.addEventListener("yt-navigate-finish", post, true);
+    window.addEventListener("yt-page-data-updated", post, true);
+    window.addEventListener("yt-player-updated", post, true);
+    // Content script asks us to refresh (e.g. new Shorts reel scrolled in).
+    window.addEventListener("message", function (e) {
+      if (e.source !== window) return;
+      if (e.data && e.data.source === "ytpcs" && e.data.type === "request") post();
+    }, true);
+    // The player response is often injected after our first look; poll shortly.
+    var n = 0;
+    var t = setInterval(function () {
+      n++;
+      post();
+      if (n > 24) clearInterval(t);
+    }, 250);
+  }
+
+  function requestPageChannelInfo() {
+    try {
+      window.postMessage({ source: "ytpcs", type: "request" }, "*");
+    } catch (_) {}
+  }
+
+  function installPageBridge() {
+    try {
+      const script = document.createElement("script");
+      script.textContent = "(" + pageBridgeFn.toString() + ")();";
+      (document.head || document.documentElement).appendChild(script);
+      script.remove();
+    } catch (_) {
+      // CSP may block injection; DOM-based detection still works.
+    }
+
+    window.addEventListener("message", (e) => {
+      if (e.source !== window) return;
+      const d = e.data;
+      if (!d || d.source !== "ytpcs" || d.type !== "channel") return;
+      const info = d.info;
+      if (!info || (!info.channelId && !info.handle)) return;
+      pageChannelInfo = {
+        key: info.channelId || info.handle,
+        channelId: info.channelId || null,
+        handle: info.handle || null,
+        name: info.name || info.handle || info.channelId,
+      };
+      if (!isRelevantPage()) return;
+      if (currentChannel && currentChannel.key === pageChannelInfo.key) return;
+      resolveAndApplyForCurrentChannel();
+    });
   }
 
   function init() {
@@ -399,22 +568,32 @@
     Widget.onChange(handleWidgetChange);
     ensureWidgetMounted();
     setupObservers();
+    installPageBridge();
+
+    // Warm the in-memory cache once so SPA channel switches can apply a saved
+    // speed synchronously instead of waiting on chrome.storage again.
+    STORAGE.getAllSpeeds().then((all) => {
+      cachePopulated = true;
+      for (const [k, v] of Object.entries(all || {})) {
+        if (v && typeof v.speed === "number") channelSpeedCache[k] = v.speed;
+      }
+      if (currentChannel) resolveAndApplyForCurrentChannel();
+    }).catch(() => {});
+
     onNavigation();
 
-    // Listen storage changes from popup (e.g., import)
-    if (chrome && chrome.storage && chrome.storage.onChanged) {
-      chrome.storage.onChanged.addListener((changes, area) => {
-        if (changes.channelSpeeds) {
-          // Re-resolve current channel speed
-          resolveAndApplyForCurrentChannel();
-        }
-      });
-    }
+    // Listen for saves/imports from the popup or other tabs.
+    STORAGE.storageAddChangedListener((changes) => {
+      if (!changes || !changes[STORAGE.STORAGE_KEY]) return;
+      // Stale cache — rebuild and re-resolve for the current channel.
+      cachePopulated = false;
+      for (const k of Object.keys(channelSpeedCache)) delete channelSpeedCache[k];
+      resolveAndApplyForCurrentChannel();
+    });
   }
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", init);
-  } else {
-    init();
-  }
+  // Run as early as possible — at document_start the video element does not
+  // exist yet, but the bridge/observers are installed immediately so the saved
+  // speed is applied the moment playback begins.
+  init();
 })();

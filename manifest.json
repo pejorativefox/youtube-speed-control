@@ -24,7 +24,7 @@
       "matches": ["*://*.youtube.com/*"],
       "js": ["src/lib/storage.js", "src/content/widget.js", "src/content/content.js"],
       "css": ["src/content/widget.css"],
-      "run_at": "document_idle"
+      "run_at": "document_start"
     }
   ]
 }

@@ -202,12 +202,43 @@ async function exportSpeeds() {
   };
 }
 
+// Best-effort synchronous read of the whole speed map, used to apply a saved
+// speed immediately on page load (before the async storage read resolves).
+// chrome.storage exposes the sync values synchronously; when the SW is asleep
+// this returns null and the caller falls back to the async read.
+function storageGetSync(key) {
+  try {
+    const getter = (chrome.storage.sync && chrome.storage.sync.get) ||
+      (chrome.storage.local && chrome.storage.local.get);
+    if (!getter) return null;
+    const res = getter({ [key]: null });
+    if (res && typeof res.then === "function") {
+      // Chrome returns a promise for the async API; not usable synchronously.
+      res.catch(() => {});
+      return null;
+    }
+    if (res && typeof res === "object" && key in res) return res[key];
+  } catch (_) {}
+  return null;
+}
+
+// Notify callers whenever the stored speed map changes (save in another tab,
+// import from popup, sync from another device).
+function storageAddChangedListener(fn) {
+  try {
+    if (chrome && chrome.storage && chrome.storage.onChanged) {
+      chrome.storage.onChanged.addListener(fn);
+    }
+  } catch (_) {}
+}
+
 // Expose globally for non-module content scripts
 if (typeof window !== "undefined") {
   window.YTPCS_Storage = {
     STORAGE_KEY, MIN_SPEED, MAX_SPEED,
     clampSpeed, getAllSpeeds, getChannelSpeed, setChannelSpeed, removeChannelSpeed,
-    validateImportedData, importSpeeds, exportSpeeds, storageGet, storageSet
+    validateImportedData, importSpeeds, exportSpeeds, storageGet, storageSet,
+    storageGetSync, storageAddChangedListener
   };
 }
 // Also for service worker / popup if using modules via global
@@ -217,7 +248,8 @@ if (typeof globalThis !== "undefined") {
     globalThis.YTPCS_Storage = {
       STORAGE_KEY, MIN_SPEED, MAX_SPEED,
       clampSpeed, getAllSpeeds, getChannelSpeed, setChannelSpeed, removeChannelSpeed,
-      validateImportedData, importSpeeds, exportSpeeds, storageGet, storageSet
+      validateImportedData, importSpeeds, exportSpeeds, storageGet, storageSet,
+      storageGetSync, storageAddChangedListener
     };
   }
 }
