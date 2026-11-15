@@ -1,10 +1,15 @@
 {
   "manifest_version": 3,
   "name": "YouTube Per-Channel Speed",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Set and remember YouTube playback speed per channel. Hover widget on video + import/export.",
-  "permissions": ["storage"],
-  "host_permissions": ["*://*.youtube.com/*"],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAhsdmXXNEgjKXaDB4HFLwD5SYr5V1YW1Q8dm1UISUje7bOJDmw3DJIRU/5N/5ublD54ONT6MIR7JHyDzlCi1UPbX5nudnYtxxULGKK3CXuczJC28PMZ62Pw7wdu6ksAuwvFyTZkACOG0R+u1kUL9NXJdeaakEQcTeg4PTnE0swdKBiDJ5s8Yx+AdPF32IXEpSoQsO7r6vw4s/2MaUpJE1zQXpTMYEsj1bDRSiqECW14uLDOScKb8swrZ6g38YNmOc6ZAkoL3SoLQYCUM3D+fqcRVX2Zm6h2qL4mCIfH9Wf5H8hLK8M2n/LC7wcgGcjwcwJyohA6JGrnaKgyFwnUpsgQIDAQAB",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "*://*.youtube.com/*"
+  ],
   "action": {
     "default_title": "YouTube Per-Channel Speed",
     "default_popup": "src/popup/popup.html",
@@ -21,9 +26,17 @@
   },
   "content_scripts": [
     {
-      "matches": ["*://*.youtube.com/*"],
-      "js": ["src/lib/storage.js", "src/content/widget.js", "src/content/content.js"],
-      "css": ["src/content/widget.css"],
+      "matches": [
+        "*://*.youtube.com/*"
+      ],
+      "js": [
+        "src/lib/storage.js",
+        "src/content/widget.js",
+        "src/content/content.js"
+      ],
+      "css": [
+        "src/content/widget.css"
+      ],
       "run_at": "document_start"
     }
   ]

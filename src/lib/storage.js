@@ -1,7 +1,7 @@
 /* global chrome */
 // Shared storage helper — loaded before content.js and popup.js (no modules needed, MV3 compatible)
 
-const STORAGE_KEY = "channelSpeeds";
+const STORAGE_KEY = "channelSpeeds"; // legacy single-map key, migrated on first read
 const MIN_SPEED = 25;
 const MAX_SPEED = 400;
 
@@ -10,6 +10,20 @@ function clampSpeed(v) {
   if (!Number.isFinite(n)) return null;
   if (n < MIN_SPEED || n > MAX_SPEED) return null;
   return n;
+}
+
+// Normalise a channel display name scraped from the DOM: collapse whitespace
+// and undo YouTube's habit of rendering the name twice ("Foo   Foo" -> "Foo").
+function cleanName(v) {
+  if (typeof v !== "string") return "";
+  let s = v.replace(/\s+/g, " ").trim();
+  const words = s.split(" ");
+  if (words.length % 2 === 0) {
+    const half = words.length / 2;
+    const a = words.slice(0, half).join(" ");
+    if (a === words.slice(half).join(" ")) s = a;
+  }
+  return s;
 }
 
 function storageAreaSync() {
@@ -55,6 +69,8 @@ async function storageSet(obj) {
   if (sync) {
     try {
       await sync.set(obj);
+      // Drop any local fallback copy so reads don't prefer stale data.
+      if (local) { try { await local.remove(Object.keys(obj)); } catch (_) {} }
       return;
     } catch (e) {
       // QuotaExceeded or sync disabled -> fallback to local
@@ -77,40 +93,123 @@ async function storageRemove(keys) {
   await Promise.all(promises);
 }
 
-// Internal: always store under single key STORAGE_KEY
-async function getAllSpeeds() {
-  const data = await storageGet({ [STORAGE_KEY]: {} });
-  const raw = data[STORAGE_KEY];
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
-  // sanitize: drop invalid entries
+// --- Per-channel layout -----------------------------------------------------
+// Each channel is its own item ("cs:<channelKey>") so the list isn't capped by
+// chrome.storage.sync's 8KB-per-item limit (sync allows ~100KB / 512 items in
+// total). Items normally live in sync; an item lands in local only when sync
+// rejected that write (quota, rate limit, sync off), and reads merge both by
+// updatedAt so nothing is lost either way.
+const ITEM_PREFIX = "cs:";
+
+function itemKey(channelKey) {
+  return ITEM_PREFIX + channelKey;
+}
+
+function sanitizeEntry(v) {
+  if (!v || typeof v !== "object") return null;
+  const speed = clampSpeed(v.speed);
+  if (speed === null) return null;
+  return {
+    handle: typeof v.handle === "string" ? v.handle : "",
+    name: cleanName(v.name),
+    speed,
+    updatedAt: typeof v.updatedAt === "number" ? v.updatedAt : 0,
+  };
+}
+
+async function areaGetAll(area) {
+  if (!area) return {};
+  try { return (await area.get(null)) || {}; } catch (_) { return {}; }
+}
+
+// Write items to sync, falling back to local if sync rejects them. A
+// successful sync write clears any local fallback copy of the same items.
+async function writeItems(items) {
+  const keys = Object.keys(items);
+  if (!keys.length) return;
+  const sync = storageAreaSync();
+  const local = storageAreaLocal();
+  if (sync) {
+    try {
+      await sync.set(items);
+      if (local) { try { await local.remove(keys); } catch (_) {} }
+      return;
+    } catch (e) {
+      if (!local) throw e;
+    }
+  }
+  if (local) await local.set(items);
+}
+
+// One-time move from the old single-map layout ({ channelSpeeds: {...} }).
+let migrationPromise = null;
+function migrateLegacy() {
+  if (migrationPromise) return migrationPromise;
+  migrationPromise = (async () => {
+    const sync = storageAreaSync();
+    const local = storageAreaLocal();
+    const legacy = {};
+    for (const area of [sync, local]) {
+      if (!area) continue;
+      let raw;
+      try { raw = (await area.get(STORAGE_KEY))[STORAGE_KEY]; } catch (_) { continue; }
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+      for (const [k, v] of Object.entries(raw)) {
+        const e = sanitizeEntry(v);
+        if (e && (!legacy[k] || e.updatedAt >= legacy[k].updatedAt)) legacy[k] = e;
+      }
+    }
+    const legacyKeys = Object.keys(legacy);
+    if (legacyKeys.length) {
+      // Don't clobber a per-channel item that is already newer.
+      const current = await readItems();
+      const items = {};
+      for (const k of legacyKeys) {
+        if (!current[k] || legacy[k].updatedAt > current[k].updatedAt) items[itemKey(k)] = legacy[k];
+      }
+      await writeItems(items);
+    }
+    await storageRemove([STORAGE_KEY]);
+  })().catch(() => { migrationPromise = null; });
+  return migrationPromise;
+}
+
+async function readItems() {
+  const [fromSync, fromLocal] = await Promise.all([
+    areaGetAll(storageAreaSync()),
+    areaGetAll(storageAreaLocal()),
+  ]);
   const out = {};
-  for (const [k, v] of Object.entries(raw)) {
-    if (!v || typeof v !== "object") continue;
-    const speed = clampSpeed(v.speed);
-    if (speed === null) continue;
-    out[k] = {
-      handle: typeof v.handle === "string" ? v.handle : "",
-      name: typeof v.name === "string" ? v.name : "",
-      speed,
-      updatedAt: typeof v.updatedAt === "number" ? v.updatedAt : Date.now(),
-    };
+  for (const src of [fromSync, fromLocal]) {
+    for (const [k, v] of Object.entries(src)) {
+      if (!k.startsWith(ITEM_PREFIX)) continue;
+      const e = sanitizeEntry(v);
+      if (!e) continue;
+      const ck = k.slice(ITEM_PREFIX.length);
+      if (!out[ck] || e.updatedAt >= out[ck].updatedAt) out[ck] = e;
+    }
   }
   return out;
+}
+
+async function getAllSpeeds() {
+  await migrateLegacy();
+  return readItems();
 }
 
 async function setChannelSpeed(channelKey, { handle, name, speed }) {
   const clamped = clampSpeed(speed);
   if (clamped === null) throw new Error(`Invalid speed ${speed}, must be ${MIN_SPEED}-${MAX_SPEED}`);
   if (!channelKey || typeof channelKey !== "string") throw new Error("Invalid channelKey");
-  const all = await getAllSpeeds();
-  all[channelKey] = {
+  await migrateLegacy();
+  const entry = {
     handle: handle || "",
-    name: name || "",
+    name: cleanName(name),
     speed: clamped,
     updatedAt: Date.now(),
   };
-  await storageSet({ [STORAGE_KEY]: all });
-  return all[channelKey];
+  await writeItems({ [itemKey(channelKey)]: entry });
+  return entry;
 }
 
 async function getChannelSpeed(channelKey) {
@@ -122,8 +221,7 @@ async function getChannelSpeed(channelKey) {
 async function removeChannelSpeed(channelKey) {
   const all = await getAllSpeeds();
   if (!(channelKey in all)) return false;
-  delete all[channelKey];
-  await storageSet({ [STORAGE_KEY]: all });
+  await storageRemove([itemKey(channelKey)]);
   return true;
 }
 
@@ -181,16 +279,16 @@ function validateImportedData(json) {
 
 async function importSpeeds(json, mode = "merge") {
   const sanitized = validateImportedData(json);
+  await migrateLegacy();
   if (mode === "replace") {
-    await storageSet({ [STORAGE_KEY]: sanitized });
-    return sanitized;
+    const existing = await readItems();
+    const drop = Object.keys(existing).filter((k) => !(k in sanitized)).map(itemKey);
+    if (drop.length) await storageRemove(drop);
   }
-  // merge
-  const existing = await getAllSpeeds();
-  const merged = { ...existing, ...sanitized };
-  // preserve updatedAt from import if newer? just overwrite imported keys
-  await storageSet({ [STORAGE_KEY]: merged });
-  return merged;
+  const items = {};
+  for (const [k, v] of Object.entries(sanitized)) items[itemKey(k)] = v;
+  await writeItems(items);
+  return readItems();
 }
 
 async function exportSpeeds() {
@@ -200,26 +298,6 @@ async function exportSpeeds() {
     exportedAt: new Date().toISOString(),
     channelSpeeds: all,
   };
-}
-
-// Best-effort synchronous read of the whole speed map, used to apply a saved
-// speed immediately on page load (before the async storage read resolves).
-// chrome.storage exposes the sync values synchronously; when the SW is asleep
-// this returns null and the caller falls back to the async read.
-function storageGetSync(key) {
-  try {
-    const getter = (chrome.storage.sync && chrome.storage.sync.get) ||
-      (chrome.storage.local && chrome.storage.local.get);
-    if (!getter) return null;
-    const res = getter({ [key]: null });
-    if (res && typeof res.then === "function") {
-      // Chrome returns a promise for the async API; not usable synchronously.
-      res.catch(() => {});
-      return null;
-    }
-    if (res && typeof res === "object" && key in res) return res[key];
-  } catch (_) {}
-  return null;
 }
 
 // Notify callers whenever the stored speed map changes (save in another tab,
@@ -236,9 +314,9 @@ function storageAddChangedListener(fn) {
 if (typeof window !== "undefined") {
   window.YTPCS_Storage = {
     STORAGE_KEY, MIN_SPEED, MAX_SPEED,
-    clampSpeed, getAllSpeeds, getChannelSpeed, setChannelSpeed, removeChannelSpeed,
+    clampSpeed, cleanName, getAllSpeeds, getChannelSpeed, setChannelSpeed, removeChannelSpeed,
     validateImportedData, importSpeeds, exportSpeeds, storageGet, storageSet,
-    storageGetSync, storageAddChangedListener
+    ITEM_PREFIX, storageAddChangedListener
   };
 }
 // Also for service worker / popup if using modules via global
@@ -247,9 +325,9 @@ if (typeof globalThis !== "undefined") {
   if (!globalThis.YTPCS_Storage) {
     globalThis.YTPCS_Storage = {
       STORAGE_KEY, MIN_SPEED, MAX_SPEED,
-      clampSpeed, getAllSpeeds, getChannelSpeed, setChannelSpeed, removeChannelSpeed,
+      clampSpeed, cleanName, getAllSpeeds, getChannelSpeed, setChannelSpeed, removeChannelSpeed,
       validateImportedData, importSpeeds, exportSpeeds, storageGet, storageSet,
-      storageGetSync, storageAddChangedListener
+      ITEM_PREFIX, storageAddChangedListener
     };
   }
 }

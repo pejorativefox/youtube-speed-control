@@ -9,17 +9,20 @@
   let lastAppliedSpeed = null;
   let channelPollTimer = null;
   let widgetMounted = false;
-  let pendingApplySpeed = null; // target rate we still owe the video
+  let pendingApplySpeed = null; // target speed (percent) we still owe the video
   let pageChannelInfo = null; // channel info reported by the main-world bridge
 
   // Content-script-scoped speed cache so repeated lookups (and the 0-ms bridge
   // event) never wait on chrome.storage more than once per page lifetime.
   const channelSpeedCache = Object.create(null);
-  let cachePopulated = false;
 
   // Fallback bucket used when the channel can't be identified; keeps playback
   // speed working instead of silently dropping the setting.
   const DEFAULT_KEY = "__default__";
+
+  const SAVE_DEBOUNCE_MS = 400;
+  let saveTimer = null;
+  let savesInFlight = 0;
 
   function isWatchPage() {
     return location.pathname === "/watch" || location.pathname.startsWith("/watch");
@@ -104,18 +107,15 @@
         const m = href.match(/\/channel\/(UC[^/?#&]+)/);
         if (m) channelId = channelId || m[1];
       }
-      const text = ownerLink.textContent.trim();
-      if (text) name = name || text;
     }
 
-    // Also try ytd-channel-name
+    // Name: the dedicated channel-name element is cleanest; the owner link's
+    // text contains the name twice plus layout whitespace, so it's a fallback.
     if (!name) {
-      const cn = document.querySelector("ytd-channel-name #text, ytd-video-owner-renderer #channel-name #text, #owner #channel-name");
-      if (cn) {
-        const t = cn.textContent.trim();
-        if (t) name = t;
-      }
+      const cn = document.querySelector("ytd-video-owner-renderer #channel-name #text, ytd-channel-name #text, #owner #channel-name");
+      if (cn) name = STORAGE.cleanName(cn.textContent) || null;
     }
+    if (!name && ownerLink) name = STORAGE.cleanName(ownerLink.textContent) || null;
 
     // Handle from any link with /@
     if (!handle) {
@@ -225,23 +225,14 @@
     return undefined;
   }
 
-  function seedCacheFromSync() {
-    cachePopulated = true;
-    if (!STORAGE.storageGetSync) return;
-    const raw = STORAGE.storageGetSync(STORAGE.STORAGE_KEY);
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
-    for (const [k, v] of Object.entries(raw)) {
-      if (!v || typeof v !== "object") continue;
-      const s = STORAGE.clampSpeed ? STORAGE.clampSpeed(v.speed) : null;
-      if (s !== null) channelSpeedCache[k] = s;
-    }
-  }
-
   // Remembers the desired rate and applies it as soon as a video exists.
   // Returns true if a video element was available.
   function applySpeedToVideo(speed) {
-    const target = Math.min(400, Math.max(25, Math.round(speed))) / 100;
-    pendingApplySpeed = target;
+    const pct = Math.min(400, Math.max(25, Math.round(speed)));
+    const target = pct / 100;
+    // Stored as a percentage — the same unit applySpeedToVideo() takes, since
+    // it is fed straight back in by the listeners and watchdog.
+    pendingApplySpeed = pct;
 
     const video = getVideoElement();
     if (!video || isAdShowing()) return false;
@@ -277,9 +268,8 @@
     currentChannel = info;
     Widget.setChannel({ key: info.key, handle: info.handle, name: info.name, channelId: info.channelId });
 
-    // Fast path: an in-page cache or a synchronous storage snapshot lets us set
-    // the rate in the same tick, i.e. before the video starts playing.
-    if (!cachePopulated) seedCacheFromSync();
+    // Fast path: the in-page cache lets us set the rate in the same tick,
+    // i.e. before the video starts playing.
     const cached = getCachedSpeed(info);
     if (cached !== undefined) {
       Widget.updateSpeedDisplay(cached);
@@ -381,42 +371,49 @@
     if (pendingApplySpeed !== null) applySpeedToVideo(pendingApplySpeed);
   }
 
+  function saveErrorMessage(e) {
+    const msg = (e && e.message) || String(e);
+    // Happens when the extension is reloaded/updated while this tab stays open.
+    if (/context invalidated/i.test(msg)) return "Extension was updated — refresh the page to save";
+    return `Failed to save: ${msg}`;
+  }
+
   function handleWidgetChange(newSpeed, channel) {
     // channel is { key, handle, name } from widget, but we prefer currentChannel
     const chan = currentChannel || channel;
     applySpeedToVideo(newSpeed);
+    // Keep the in-memory cache in step with the click, otherwise any
+    // re-resolve before/after the storage write reverts to the stale value.
+    if (chan && chan.key) cacheSpeed(chan, newSpeed);
+    else channelSpeedCache[DEFAULT_KEY] = newSpeed;
 
-    if (!chan || !chan.key) {
+    // Debounce the write: rapid clicks only save the final value, which keeps
+    // us well inside chrome.storage.sync's write-rate limits.
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      persistSpeed(newSpeed, chan);
+    }, SAVE_DEBOUNCE_MS);
+  }
+
+  function persistSpeed(newSpeed, chan) {
+    let key, meta, label;
+    if (chan && chan.key) {
+      key = chan.channelId || chan.key;
+      meta = { handle: chan.handle || "", name: chan.name || "" };
+      label = chan.handle || chan.name || chan.key;
+    } else {
       // No channel detected yet — remember it site-wide so the speed still
       // applies on reload instead of being silently dropped.
-      STORAGE.setChannelSpeed(DEFAULT_KEY, {
-        handle: "",
-        name: "All channels",
-        speed: newSpeed,
-      }).then(() => {
-        Widget.showToast(`Saved ${newSpeed}% for all channels`);
-      }).catch((e) => {
-        Widget.showToast(`Failed to save: ${e.message}`);
-      });
-      return;
+      key = DEFAULT_KEY;
+      meta = { handle: "", name: "All channels" };
+      label = "all channels";
     }
-
-    // Persist under both channelId and handle if we have both, but primary is key
-    // Also store handle/name for popup display
-    const primaryKey = chan.channelId || chan.key;
-    STORAGE.setChannelSpeed(primaryKey, {
-      handle: chan.handle || "",
-      name: chan.name || "",
-      speed: newSpeed,
-    }).then(() => {
-      // If we have both IDs, also store under handle for lookup migration help? Keep single source.
-      Widget.showToast(`Saved ${newSpeed}% for ${chan.handle || chan.name || chan.key}`);
-    }).catch((e) => {
-      Widget.showToast(`Failed to save: ${e.message}`);
-    });
-
-    // If channel has both channelId and handle and we saved under channelId,
-    // also remove stale handle entry if exists to avoid divergence? Not needed.
+    savesInFlight++;
+    STORAGE.setChannelSpeed(key, { ...meta, speed: newSpeed })
+      .then(() => Widget.showToast(`Saved ${newSpeed}% for ${label}`))
+      .catch((e) => Widget.showToast(saveErrorMessage(e)))
+      .finally(() => { savesInFlight--; });
   }
 
   function onNavigation() {
@@ -476,7 +473,7 @@
       if (src !== lastVideoSrc) bindVideoListeners();
       if (pendingApplySpeed !== null && !isAdShowing() && !isApplyingRate) {
         const resetToDefault =
-          Math.abs(v.playbackRate - 1) < 0.001 && Math.abs(pendingApplySpeed - 1) >= 0.01;
+          Math.abs(v.playbackRate - 1) < 0.001 && pendingApplySpeed !== 100;
         if (resetToDefault) applySpeedToVideo(pendingApplySpeed);
       }
     }, 1000);
@@ -573,7 +570,6 @@
     // Warm the in-memory cache once so SPA channel switches can apply a saved
     // speed synchronously instead of waiting on chrome.storage again.
     STORAGE.getAllSpeeds().then((all) => {
-      cachePopulated = true;
       for (const [k, v] of Object.entries(all || {})) {
         if (v && typeof v.speed === "number") channelSpeedCache[k] = v.speed;
       }
@@ -584,11 +580,17 @@
 
     // Listen for saves/imports from the popup or other tabs.
     STORAGE.storageAddChangedListener((changes) => {
-      if (!changes || !changes[STORAGE.STORAGE_KEY]) return;
-      // Stale cache — rebuild and re-resolve for the current channel.
-      cachePopulated = false;
-      for (const k of Object.keys(channelSpeedCache)) delete channelSpeedCache[k];
-      resolveAndApplyForCurrentChannel();
+      if (!changes || !Object.keys(changes).some((k) => k.startsWith(STORAGE.ITEM_PREFIX))) return;
+      // Our own pending/in-flight save already updated the cache; re-reading
+      // mid-write could briefly revert to the previous value.
+      if (saveTimer || savesInFlight) return;
+      // Saved elsewhere (popup, another tab, another device): reload the
+      // merged sync+local view and re-apply for the current channel.
+      STORAGE.getAllSpeeds().then((all) => {
+        for (const k of Object.keys(channelSpeedCache)) delete channelSpeedCache[k];
+        for (const [k, v] of Object.entries(all || {})) channelSpeedCache[k] = v.speed;
+        resolveAndApplyForCurrentChannel();
+      }).catch(() => {});
     });
   }
 
